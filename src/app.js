@@ -13,7 +13,43 @@ const auditRoutes = require("./routes/auditRoutes");
 
 const app = express();
 
-app.use(cors({ origin: ["http://localhost:3000"], credentials: true }));
+function parseOrigins(...values) {
+  const set = new Set();
+  values
+    .flatMap((value) => String(value || "").split(","))
+    .map((item) => item.trim().replace(/\/$/, ""))
+    .filter(Boolean)
+    .forEach((item) => set.add(item));
+  return Array.from(set);
+}
+
+const ALLOWED_ORIGINS = parseOrigins(
+  process.env.CLIENT_ORIGINS,
+  process.env.CLIENT_ORIGIN,
+  "http://localhost:3000"
+);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow same-origin / non-browser tools (no Origin header)
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+app.use((err, req, res, next) => {
+  if (err && String(err.message || "").startsWith("CORS blocked")) {
+    return res.status(403).json({ message: "Origin not allowed" });
+  }
+  return next(err);
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -26,7 +62,7 @@ app.use("/api/v1/material-requests", materialRequestRoutes);
 app.use("/api/v1/audits", auditRoutes);
 
 app.get("/api/v1/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", allowedOrigins: ALLOWED_ORIGINS });
 });
 
 const PORT = process.env.PORT || 7002;
@@ -35,5 +71,6 @@ dbConnect().then(async () => {
   await seed();
   app.listen(PORT, () => {
     console.log(`ServHub API running on port ${PORT}`);
+    console.log(`CORS allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 });
