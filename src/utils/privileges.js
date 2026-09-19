@@ -1,6 +1,7 @@
 const {
   WORKFLOW_ROLES,
   normalizeRole,
+  listFilterForRole,
 } = require("../workflow/materialRequestFlow");
 
 function mergePrivilegeMaps(...maps) {
@@ -49,7 +50,12 @@ function hasPrivilege(user, moduleKey, action = "view") {
 }
 
 const ASSIGNABLE_BY_ADMIN = ["requestor", "user"];
-const ASSIGNABLE_BY_SUPER = ["admin", "requestor", "user", ...WORKFLOW_ROLES.filter((r) => r !== "requestor")];
+const ASSIGNABLE_BY_SUPER = [
+  "admin",
+  "requestor",
+  "user",
+  ...WORKFLOW_ROLES.filter((r) => r !== "requestor"),
+];
 
 function canAssignRole(actor, targetRole) {
   if (!targetRole) return false;
@@ -73,19 +79,8 @@ function scopedUserQuery(actor) {
   };
 }
 
-/** Who can see which material requests */
 function scopedMrFilter(actor) {
-  const role = normalizeRole(actor.role);
-  if (actor.role === "super_admin" || role === "procurement" || role === "finance" || role === "supplier") {
-    return {};
-  }
-  if (role === "requestor") {
-    return { requestedById: actor.id };
-  }
-  if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
-    return { department: actor.department || "__none__" };
-  }
-  return { requestedById: actor.id };
+  return listFilterForRole(actor);
 }
 
 function toPublicUser(user) {

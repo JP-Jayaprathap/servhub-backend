@@ -22,6 +22,7 @@ const materialRequestSchema = new mongoose.Schema(
     quantity: { type: String, trim: true, default: "" },
     amount: { type: Number, default: 0 },
     supplier: { type: String, trim: true, default: "" },
+    quotation: { type: String, trim: true, default: "" },
     status: { type: String, default: "Draft" },
     paymentStatus: { type: String, default: "Not started" },
     date: { type: String, trim: true, default: "" },

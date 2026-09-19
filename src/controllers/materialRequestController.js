@@ -44,6 +44,7 @@ function toPublic(record) {
     quantity: record.quantity || "",
     amount: record.amount || 0,
     supplier: record.supplier || "",
+    quotation: record.quotation || "",
     status: record.status,
     paymentStatus: record.paymentStatus,
     date: record.date,
@@ -54,11 +55,23 @@ function toPublic(record) {
 function canAccessRecord(actor, record) {
   const role = normalizeRole(actor.role);
   if (actor.role === "super_admin") return true;
-  if (["procurement", "finance", "supplier"].includes(role)) return true;
+  if (["procurement", "finance"].includes(role)) return true;
+  if (role === "supplier") {
+    return [
+      "RFQ Issued",
+      "Ordered",
+      "In transit",
+      "PO Rejected",
+      "Pending Receipt",
+    ].includes(record.status);
+  }
   if (role === "requestor") return String(record.requestedById) === actor.id;
   if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
-    if (!actor.department) return true;
-    return !record.department || record.department === actor.department;
+    const actorDept = String(actor.department || "").trim().toLowerCase();
+    if (!actorDept) return true;
+    const recordDept = String(record.department || "").trim().toLowerCase();
+    // Allow same department, or legacy MRs with no department set
+    return !recordDept || recordDept === actorDept;
   }
   return String(record.requestedById) === actor.id;
 }
@@ -115,6 +128,13 @@ const createRequest = async (req, res) => {
     }
 
     const nextStatus = status === "Requested" ? "Requested" : "Draft";
+    const department = String(req.user.department || "").trim().toLowerCase();
+    if (!department) {
+      return res.status(400).json({
+        message: "Your profile has no department. Ask Super Admin to assign a department before creating MRs.",
+      });
+    }
+
     const mrNo = await nextMrNo();
     const record = await MaterialRequest.create({
       mrNo,
@@ -125,7 +145,7 @@ const createRequest = async (req, res) => {
       amount: summary.amount,
       requestedBy: req.user.name,
       requestedById: req.user.id,
-      department: req.user.department || "",
+      department,
       status: nextStatus,
       paymentStatus: "Not started",
       date: formatDate(),
@@ -154,14 +174,15 @@ const updateRequest = async (req, res) => {
       return res.status(403).json({ message: "You cannot update this material request" });
     }
 
-    const { project, justification, products, status, supplier, paymentStatus } = req.body;
+    const { project, justification, products, status, supplier, paymentStatus, quotation } = req.body;
     const previousStatus = record.status;
     const contentChange =
       Boolean(project) ||
       justification !== undefined ||
-      Array.isArray(products) ||
-      supplier !== undefined;
+      Array.isArray(products);
     const statusChange = Boolean(status) && status !== previousStatus;
+    const quotationUpdate = quotation !== undefined;
+    const role = normalizeRole(req.user.role);
 
     if (contentChange) {
       if (!hasPrivilege(req.user, "material_requests", "edit")) {
@@ -171,6 +192,24 @@ const updateRequest = async (req, res) => {
         return res.status(403).json({
           message: "Sent requests cannot be edited. Only Draft or Returned requests can be changed.",
         });
+      }
+    }
+
+    if (quotationUpdate) {
+      const canQuote =
+        req.user.role === "super_admin" ||
+        role === "supplier" ||
+        role === "procurement";
+      if (!canQuote) {
+        return res.status(403).json({ message: "You cannot submit quotations" });
+      }
+      if (!String(quotation || "").trim()) {
+        return res.status(400).json({ message: "Quotation text is required" });
+      }
+      record.quotation = String(quotation).trim();
+      if (supplier !== undefined) record.supplier = String(supplier).trim();
+      else if (role === "supplier" && !record.supplier) {
+        record.supplier = req.user.name;
       }
     }
 
@@ -184,7 +223,10 @@ const updateRequest = async (req, res) => {
       if (!hasTransitionPrivilege(req.user, transition)) {
         return res.status(403).json({ message: "Missing privilege for this workflow action" });
       }
-    } else if (!contentChange && !paymentStatus && supplier === undefined) {
+      if (transition.requiresQuotation && !String(record.quotation || quotation || "").trim()) {
+        return res.status(400).json({ message: "Enter quotation text before continuing" });
+      }
+    } else if (!contentChange && !paymentStatus && supplier === undefined && !quotationUpdate) {
       if (!hasPrivilege(req.user, "material_requests", "edit")) {
         return res.status(403).json({ message: "You cannot update material requests" });
       }
@@ -210,16 +252,18 @@ const updateRequest = async (req, res) => {
         record.paymentStatus = "Released";
       }
     }
-    if (supplier !== undefined) record.supplier = supplier;
+    if (supplier !== undefined && !quotationUpdate) record.supplier = supplier;
     if (paymentStatus) record.paymentStatus = paymentStatus;
     await record.save();
 
     await logAudit({
-      action: statusChange ? "status_change" : "update",
+      action: statusChange ? "status_change" : quotationUpdate ? "quotation" : "update",
       module: "material_requests",
       summary: statusChange
         ? `${record.mrNo}: ${previousStatus} → ${record.status}`
-        : `Updated ${record.mrNo}`,
+        : quotationUpdate
+          ? `Quotation updated on ${record.mrNo}`
+          : `Updated ${record.mrNo}`,
       actor: req.user,
       targetType: "material_request",
       targetId: record.mrNo,
