@@ -32,7 +32,6 @@ const ALLOWED_ORIGINS = parseOrigins(
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow same-origin / non-browser tools (no Origin header)
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
       return callback(new Error(`CORS blocked for origin: ${origin}`));
@@ -53,6 +52,25 @@ app.use((err, req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+let dbReady = null;
+function ensureDb() {
+  if (!dbReady) {
+    dbReady = dbConnect().then(async () => {
+      await seed();
+    });
+  }
+  return dbReady;
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await ensureDb();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/users", userRoutes);
 app.use("/api/v1/roles", roleRoutes);
@@ -67,10 +85,18 @@ app.get("/api/v1/health", (req, res) => {
 
 const PORT = process.env.PORT || 7002;
 
-dbConnect().then(async () => {
-  await seed();
-  app.listen(PORT, () => {
-    console.log(`ServHub API running on port ${PORT}`);
-    console.log(`CORS allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
-  });
-});
+if (!process.env.VERCEL) {
+  ensureDb()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`ServHub API running on port ${PORT}`);
+        console.log(`CORS allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Failed to start API:", error.message);
+      process.exit(1);
+    });
+}
+
+module.exports = app;
