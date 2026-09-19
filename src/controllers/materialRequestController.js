@@ -1,6 +1,11 @@
 const MaterialRequest = require("../models/materialRequestModel");
-const { hasPrivilege } = require("../utils/privileges");
+const { hasPrivilege, scopedMrFilter, normalizeRole } = require("../utils/privileges");
 const { logAudit } = require("../utils/audit");
+const {
+  EDITABLE_STATUSES,
+  findTransition,
+  isEditableStatus,
+} = require("../workflow/materialRequestFlow");
 
 function formatDate(value = new Date()) {
   return value.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
@@ -46,14 +51,37 @@ function toPublic(record) {
   };
 }
 
+function canAccessRecord(actor, record) {
+  const role = normalizeRole(actor.role);
+  if (actor.role === "super_admin") return true;
+  if (["procurement", "finance", "supplier"].includes(role)) return true;
+  if (role === "requestor") return String(record.requestedById) === actor.id;
+  if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
+    if (!actor.department) return true;
+    return !record.department || record.department === actor.department;
+  }
+  return String(record.requestedById) === actor.id;
+}
+
+function hasTransitionPrivilege(actor, transition) {
+  if (actor.role === "super_admin") return true;
+  if (!transition?.privilege) {
+    return (
+      hasPrivilege(actor, "material_requests", "edit") ||
+      hasPrivilege(actor, "approvals", "approve") ||
+      hasPrivilege(actor, "approvals", "reject") ||
+      hasPrivilege(actor, "purchase_orders", "edit") ||
+      hasPrivilege(actor, "deliveries", "edit") ||
+      hasPrivilege(actor, "procurement", "edit")
+    );
+  }
+  const [moduleKey, action] = transition.privilege.split(".");
+  return hasPrivilege(actor, moduleKey, action);
+}
+
 const listRequests = async (req, res) => {
   try {
-    const filter = {};
-    if (req.user.role === "user") {
-      filter.requestedById = req.user.id;
-    } else if (req.user.role === "admin" && req.user.department) {
-      filter.department = req.user.department;
-    }
+    const filter = scopedMrFilter(req.user);
     const rows = await MaterialRequest.find(filter).sort({ createdAt: -1 });
     res.status(200).json({ materialRequests: rows.map(toPublic) });
   } catch (error) {
@@ -65,16 +93,8 @@ const getRequest = async (req, res) => {
   try {
     const record = await MaterialRequest.findOne({ mrNo: req.params.id });
     if (!record) return res.status(404).json({ message: "Material request not found" });
-    if (req.user.role === "user" && String(record.requestedById) !== req.user.id) {
-      return res.status(403).json({ message: "You can only view your own requests" });
-    }
-    if (
-      req.user.role === "admin" &&
-      req.user.department &&
-      record.department &&
-      record.department !== req.user.department
-    ) {
-      return res.status(403).json({ message: "You can only view requests in your department" });
+    if (!canAccessRecord(req.user, record)) {
+      return res.status(403).json({ message: "You cannot view this material request" });
     }
     res.status(200).json({ materialRequest: toPublic(record) });
   } catch (error) {
@@ -94,6 +114,7 @@ const createRequest = async (req, res) => {
       return res.status(400).json({ message: "Add at least one product row" });
     }
 
+    const nextStatus = status === "Requested" ? "Requested" : "Draft";
     const mrNo = await nextMrNo();
     const record = await MaterialRequest.create({
       mrNo,
@@ -105,7 +126,7 @@ const createRequest = async (req, res) => {
       requestedBy: req.user.name,
       requestedById: req.user.id,
       department: req.user.department || "",
-      status: status || "Draft",
+      status: nextStatus,
       paymentStatus: "Not started",
       date: formatDate(),
     });
@@ -125,17 +146,12 @@ const createRequest = async (req, res) => {
   }
 };
 
-const editableStatuses = ["Draft", "Returned"];
-
 const updateRequest = async (req, res) => {
   try {
-    if (!hasPrivilege(req.user, "material_requests", "edit")) {
-      return res.status(403).json({ message: "You cannot update material requests" });
-    }
     const record = await MaterialRequest.findOne({ mrNo: req.params.id });
     if (!record) return res.status(404).json({ message: "Material request not found" });
-    if (req.user.role === "user" && String(record.requestedById) !== req.user.id) {
-      return res.status(403).json({ message: "You can only update your own requests" });
+    if (!canAccessRecord(req.user, record)) {
+      return res.status(403).json({ message: "You cannot update this material request" });
     }
 
     const { project, justification, products, status, supplier, paymentStatus } = req.body;
@@ -145,11 +161,33 @@ const updateRequest = async (req, res) => {
       justification !== undefined ||
       Array.isArray(products) ||
       supplier !== undefined;
+    const statusChange = Boolean(status) && status !== previousStatus;
 
-    if (contentChange && !editableStatuses.includes(record.status)) {
-      return res.status(403).json({
-        message: "Sent requests cannot be edited. Only Draft or Returned requests can be changed.",
-      });
+    if (contentChange) {
+      if (!hasPrivilege(req.user, "material_requests", "edit")) {
+        return res.status(403).json({ message: "You cannot edit material request content" });
+      }
+      if (!isEditableStatus(record.status)) {
+        return res.status(403).json({
+          message: "Sent requests cannot be edited. Only Draft or Returned requests can be changed.",
+        });
+      }
+    }
+
+    if (statusChange) {
+      const transition = findTransition(req.user.role, previousStatus, status);
+      if (!transition) {
+        return res.status(403).json({
+          message: `Your role cannot move this request from "${previousStatus}" to "${status}".`,
+        });
+      }
+      if (!hasTransitionPrivilege(req.user, transition)) {
+        return res.status(403).json({ message: "Missing privilege for this workflow action" });
+      }
+    } else if (!contentChange && !paymentStatus && supplier === undefined) {
+      if (!hasPrivilege(req.user, "material_requests", "edit")) {
+        return res.status(403).json({ message: "You cannot update material requests" });
+      }
     }
 
     if (project) record.project = project;
@@ -163,14 +201,25 @@ const updateRequest = async (req, res) => {
       record.quantity = summary.quantity;
       record.amount = summary.amount;
     }
-    if (status) record.status = status;
+    if (statusChange) {
+      record.status = status;
+      if (["Ordered", "PO Issued"].includes(status) && record.paymentStatus === "Not started") {
+        record.paymentStatus = "Open";
+      }
+      if (["Delivered", "Closed"].includes(status)) {
+        record.paymentStatus = "Released";
+      }
+    }
     if (supplier !== undefined) record.supplier = supplier;
     if (paymentStatus) record.paymentStatus = paymentStatus;
     await record.save();
+
     await logAudit({
-      action: status && status !== previousStatus ? "status_change" : "update",
+      action: statusChange ? "status_change" : "update",
       module: "material_requests",
-      summary: `Updated ${record.mrNo} → ${record.status}`,
+      summary: statusChange
+        ? `${record.mrNo}: ${previousStatus} → ${record.status}`
+        : `Updated ${record.mrNo}`,
       actor: req.user,
       targetType: "material_request",
       targetId: record.mrNo,
@@ -184,19 +233,21 @@ const updateRequest = async (req, res) => {
 
 const deleteRequest = async (req, res) => {
   try {
-    if (!hasPrivilege(req.user, "material_requests", "delete") && req.user.role !== "user") {
-      return res.status(403).json({ message: "You cannot delete material requests" });
-    }
     const record = await MaterialRequest.findOne({ mrNo: req.params.id });
     if (!record) return res.status(404).json({ message: "Material request not found" });
-    if (req.user.role === "user") {
+    const role = normalizeRole(req.user.role);
+
+    if (role === "requestor") {
       if (String(record.requestedById) !== req.user.id) {
         return res.status(403).json({ message: "You can only delete your own draft requests" });
       }
-      if (!editableStatuses.includes(record.status)) {
+      if (!EDITABLE_STATUSES.includes(record.status)) {
         return res.status(403).json({ message: "Only draft or returned requests can be deleted" });
       }
+    } else if (!hasPrivilege(req.user, "material_requests", "delete")) {
+      return res.status(403).json({ message: "You cannot delete material requests" });
     }
+
     await record.deleteOne();
     await logAudit({
       action: "delete",

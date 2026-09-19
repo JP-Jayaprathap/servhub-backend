@@ -26,7 +26,8 @@ function parseOrigins(...values) {
 const ALLOWED_ORIGINS = parseOrigins(
   process.env.CLIENT_ORIGINS,
   process.env.CLIENT_ORIGIN,
-  "http://localhost:3000"
+  "http://localhost:3000",
+  "http://172.22.138.122:3000"
 );
 
 app.use(

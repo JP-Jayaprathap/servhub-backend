@@ -1,3 +1,8 @@
+const {
+  WORKFLOW_ROLES,
+  normalizeRole,
+} = require("../workflow/materialRequestFlow");
+
 function mergePrivilegeMaps(...maps) {
   const next = {};
   maps.forEach((map) => {
@@ -16,8 +21,9 @@ function resolvePrivileges(user, rolePrivileges = {}, departmentPrivileges = {})
     return JSON.parse(JSON.stringify(rolePrivileges.super_admin || {}));
   }
 
+  const roleKey = normalizeRole(user.role);
   const privileges = mergePrivilegeMaps(
-    rolePrivileges[user.role] || {},
+    rolePrivileges[user.role] || rolePrivileges[roleKey] || {},
     user.role === "admin" ? departmentPrivileges[user.department] || {} : {}
   );
 
@@ -42,21 +48,44 @@ function hasPrivilege(user, moduleKey, action = "view") {
   return Boolean(user.privileges?.[moduleKey]?.includes(action));
 }
 
+const ASSIGNABLE_BY_ADMIN = ["requestor", "user"];
+const ASSIGNABLE_BY_SUPER = ["admin", "requestor", "user", ...WORKFLOW_ROLES.filter((r) => r !== "requestor")];
+
 function canAssignRole(actor, targetRole) {
   if (!targetRole) return false;
   if (targetRole === "super_admin") return false;
-  if (!["admin", "user"].includes(targetRole)) return false;
-  if (actor.role === "super_admin") return true;
-  if (actor.role === "admin") return true;
+  if (actor.role === "super_admin") return ASSIGNABLE_BY_SUPER.includes(targetRole);
+  if (actor.role === "admin") return ASSIGNABLE_BY_ADMIN.includes(targetRole);
   return false;
 }
 
 function scopedUserQuery(actor) {
   if (actor.role === "super_admin") return {};
+  if (actor.role === "admin") {
+    return {
+      department: actor.department || "__none__",
+      role: { $nin: ["super_admin"] },
+    };
+  }
   return {
     department: actor.department || "__none__",
-    role: { $in: ["admin", "user"] },
+    role: { $in: ["requestor", "user", "admin"] },
   };
+}
+
+/** Who can see which material requests */
+function scopedMrFilter(actor) {
+  const role = normalizeRole(actor.role);
+  if (actor.role === "super_admin" || role === "procurement" || role === "finance" || role === "supplier") {
+    return {};
+  }
+  if (role === "requestor") {
+    return { requestedById: actor.id };
+  }
+  if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
+    return { department: actor.department || "__none__" };
+  }
+  return { requestedById: actor.id };
 }
 
 function toPublicUser(user) {
@@ -89,6 +118,8 @@ module.exports = {
   hasPrivilege,
   canAssignRole,
   scopedUserQuery,
+  scopedMrFilter,
   toPublicUser,
   generatePassword,
+  normalizeRole,
 };
