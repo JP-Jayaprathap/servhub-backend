@@ -74,7 +74,12 @@ const roleActions = {
       { label: "Recommend (framework / direct)", status: STATUSES.PENDING_COMMERCIAL, tone: "approve" },
     ],
     [STATUSES.RFQ_ISSUED]: [
-      { label: "Capture quotes & recommend", status: STATUSES.PENDING_COMMERCIAL, tone: "approve" },
+      {
+        label: "Recommend with quotation",
+        status: STATUSES.PENDING_COMMERCIAL,
+        tone: "approve",
+        requiresQuotation: true,
+      },
     ],
     [STATUSES.PENDING_PO]: [
       { label: "Create & issue PO", status: STATUSES.ORDERED, tone: "approve" },
@@ -119,6 +124,14 @@ const roleActions = {
     ],
   },
   supplier: {
+    [STATUSES.RFQ_ISSUED]: [
+      {
+        label: "Submit quotation",
+        status: STATUSES.RFQ_ISSUED,
+        tone: "edit",
+        requiresQuotation: true,
+      },
+    ],
     [STATUSES.ORDERED]: [
       { label: "Accept PO & dispatch", status: STATUSES.IN_TRANSIT, tone: "approve" },
       { label: "Reject PO", status: STATUSES.PO_REJECTED, tone: "reject" },
@@ -171,10 +184,31 @@ function isEditableStatus(status) {
   return EDITABLE_STATUSES.includes(status);
 }
 
+/** Statuses each role should primarily work on (DAAM queue). */
+const roleInboxStatuses = {
+  requestor: null,
+  manager: [STATUSES.REQUESTED, STATUSES.RETURNED, STATUSES.REJECTED, STATUSES.APPROVED],
+  department_head: [STATUSES.PENDING_COMMERCIAL],
+  finance: [STATUSES.PENDING_FINANCE],
+  procurement: [
+    STATUSES.APPROVED,
+    STATUSES.SOURCING,
+    STATUSES.RFQ_ISSUED,
+    STATUSES.PENDING_COMMERCIAL,
+    STATUSES.PENDING_PO,
+    STATUSES.PO_REJECTED,
+    STATUSES.DELIVERED,
+  ],
+  supplier: [STATUSES.RFQ_ISSUED, STATUSES.ORDERED, STATUSES.IN_TRANSIT, STATUSES.PO_REJECTED],
+  in_charge: [STATUSES.PENDING_RECEIPT, STATUSES.DISCREPANCY, STATUSES.DELIVERED],
+};
+
 const stageStatuses = {
   material_requests: null,
   approvals: [
     STATUSES.REQUESTED,
+    STATUSES.RETURNED,
+    STATUSES.REJECTED,
     STATUSES.APPROVED,
     STATUSES.PENDING_COMMERCIAL,
     STATUSES.PENDING_FINANCE,
@@ -203,6 +237,71 @@ const stageStatuses = {
     STATUSES.CLOSED,
   ],
 };
+
+/** Mongo filter: who can list which MRs */
+function listFilterForRole(actor) {
+  const role = normalizeRole(actor.role);
+  if (actor.role === "super_admin") return {};
+
+  if (role === "requestor") {
+    return { requestedById: actor.id };
+  }
+
+  // Cross-department functions
+  if (role === "procurement" || role === "finance") {
+    return {};
+  }
+
+  if (role === "supplier") {
+    return {
+      status: {
+        $in: roleInboxStatuses.supplier,
+      },
+    };
+  }
+
+  // Department-scoped: manager, head, in-charge, admin
+  if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
+    const dept = String(actor.department || "").trim().toLowerCase();
+    if (!dept) {
+      const inbox = roleInboxStatuses[role];
+      return inbox ? { status: { $in: inbox } } : {};
+    }
+    const escaped = dept.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return {
+      $or: [
+        { department: dept },
+        { department: new RegExp(`^${escaped}$`, "i") },
+        // Legacy MRs created before department was required
+        { department: "" },
+        { department: { $exists: false } },
+      ],
+    };
+  }
+
+  return { requestedById: actor.id };
+}
+
+function statusesForStage(moduleKey, roleKey) {
+  const role = normalizeRole(roleKey);
+  if (moduleKey === "approvals") {
+    if (role === "manager") {
+      return [STATUSES.REQUESTED, STATUSES.RETURNED, STATUSES.REJECTED, STATUSES.APPROVED];
+    }
+    if (role === "department_head") return [STATUSES.PENDING_COMMERCIAL];
+    if (role === "finance") return [STATUSES.PENDING_FINANCE];
+  }
+  if (moduleKey === "procurement" && role === "procurement") {
+    return roleInboxStatuses.procurement;
+  }
+  if (moduleKey === "purchase_orders" && role === "supplier") {
+    return [STATUSES.ORDERED, STATUSES.IN_TRANSIT, STATUSES.PO_REJECTED];
+  }
+  if (moduleKey === "deliveries" && role === "in_charge") {
+    return roleInboxStatuses.in_charge;
+  }
+  return stageStatuses[moduleKey];
+}
 
 const roleCatalog = [
   { name: "Super Admin", key: "super_admin" },
@@ -298,10 +397,13 @@ module.exports = {
   roleActions,
   roleCatalog,
   rolePrivileges,
+  roleInboxStatuses,
   stageStatuses,
   normalizeRole,
   actionsFor,
   canTransition,
   findTransition,
   isEditableStatus,
+  listFilterForRole,
+  statusesForStage,
 };
