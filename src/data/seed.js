@@ -2,6 +2,8 @@ const bcrypt = require("bcryptjs");
 const Role = require("../models/roleModel");
 const User = require("../models/userModel");
 const Department = require("../models/departmentModel");
+const Material = require("../models/materialModel");
+const ProjectManager = require("../models/projectManagerModel");
 const { roleCatalog, rolePrivileges } = require("../workflow/materialRequestFlow");
 
 const recordAccess = ["view", "create", "edit"];
@@ -65,6 +67,58 @@ const users = [
   },
   // legacy alias kept for existing logins
   { name: "Workspace User", email: "user@erp.com", password: "123456", role: "requestor", department: "hr" },
+  {
+    name: "Purchase Requestor",
+    email: "purchase.requestor@erp.com",
+    password: "123456",
+    role: "requestor",
+    department: "purchase",
+  },
+  {
+    name: "Purchase Manager",
+    email: "purchase.manager@erp.com",
+    password: "123456",
+    role: "manager",
+    department: "purchase",
+  },
+  {
+    name: "Development Requestor",
+    email: "development.requestor@erp.com",
+    password: "123456",
+    role: "requestor",
+    department: "development",
+  },
+  {
+    name: "Development Manager",
+    email: "development.manager@erp.com",
+    password: "123456",
+    role: "manager",
+    department: "development",
+  },
+  {
+    name: "Finance Requestor",
+    email: "finance.requestor@erp.com",
+    password: "123456",
+    role: "requestor",
+    department: "finance",
+  },
+  {
+    name: "Finance Manager",
+    email: "finance.manager@erp.com",
+    password: "123456",
+    role: "manager",
+    department: "finance",
+  },
+  { name: "Back Office", email: "backoffice@erp.com", password: "123456", role: "back_office" },
+];
+
+const materials = [
+  { productId: "HR-PEN", name: "Ballpoint pen", project: "Office renovation", department: "hr", unit: "box" },
+  { productId: "HR-PAPER", name: "A4 paper", project: "Office renovation", department: "hr", unit: "ream" },
+  { productId: "PUR-CABLE", name: "Power cable", project: "Site setup", department: "purchase", unit: "pcs" },
+  { productId: "PUR-GLOVES", name: "Safety gloves", project: "Site setup", department: "purchase", unit: "pair" },
+  { productId: "DEV-LAPTOP", name: "Laptop", project: "Workstation rollout", department: "development", unit: "pcs" },
+  { productId: "FIN-FOLDER", name: "Document folder", project: "Year-end audit", department: "finance", unit: "pcs" },
 ];
 
 async function seedDepartments() {
@@ -75,6 +129,49 @@ async function seedDepartments() {
       { name: item.name, key: item.key, privileges: item.privileges },
       { upsert: true, returnDocument: "after" }
     );
+  }
+}
+
+async function seedMaterials() {
+  for (const item of materials) {
+    const exists = await Material.findOne({ productId: item.productId });
+    if (!exists) {
+      await Material.create({ ...item, active: true });
+      continue;
+    }
+    if (!String(exists.project || "").trim()) {
+      exists.project = item.project;
+      await exists.save();
+    }
+  }
+}
+
+async function seedProjectManagers() {
+  const rows = await Material.find().select("project department");
+  const seen = new Set();
+  for (const item of rows) {
+    const project = String(item.project || "").trim();
+    const department = String(item.department || "").trim().toLowerCase();
+    const projectKey = project.toLowerCase();
+    if (!projectKey || !department) continue;
+    const key = `${projectKey}|${department}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const exists = await ProjectManager.findOne({ projectKey, department });
+    if (exists) continue;
+    const manager = await User.findOne({
+      department,
+      role: "manager",
+      active: { $ne: false },
+    }).sort({ name: 1 });
+    if (!manager) continue;
+    await ProjectManager.create({
+      project,
+      projectKey,
+      department,
+      managerId: manager._id,
+      managerName: manager.name,
+    });
   }
 }
 
@@ -103,6 +200,7 @@ async function seed() {
   );
 
   await seedDepartments();
+  await seedMaterials();
 
   for (const item of users) {
     const exists = await User.findOne({ email: item.email });
@@ -131,6 +229,8 @@ async function seed() {
       active: true,
     });
   }
+
+  await seedProjectManagers();
 }
 
-module.exports = { seed, seedDepartments, rolePrivileges };
+module.exports = { seed, seedDepartments, seedMaterials, seedProjectManagers, rolePrivileges };

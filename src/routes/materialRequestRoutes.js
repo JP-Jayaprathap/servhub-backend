@@ -1,6 +1,7 @@
 const express = require("express");
 const { verifyToken, requirePrivilege } = require("../middlewares/authMiddleware");
 const {
+  listAssignees,
   listRequests,
   getRequest,
   createRequest,
@@ -12,6 +13,7 @@ const router = express.Router();
 
 router.use(verifyToken);
 router.get("/", requirePrivilege("material_requests", "view"), listRequests);
+router.get("/assignees", listAssignees);
 router.get("/:id", requirePrivilege("material_requests", "view"), getRequest);
 router.post("/", requirePrivilege("material_requests", "create"), createRequest);
 router.put("/:id", requirePrivilege("material_requests", "edit"), updateRequest);

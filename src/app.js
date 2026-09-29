@@ -9,6 +9,7 @@ const roleRoutes = require("./routes/roleRoutes");
 const deleteRequestRoutes = require("./routes/deleteRequestRoutes");
 const departmentRoutes = require("./routes/departmentRoutes");
 const materialRequestRoutes = require("./routes/materialRequestRoutes");
+const materialRoutes = require("./routes/materialRoutes");
 const auditRoutes = require("./routes/auditRoutes");
 
 const app = express();
@@ -79,6 +80,7 @@ app.use("/api/v1/roles", roleRoutes);
 app.use("/api/v1/delete-requests", deleteRequestRoutes);
 app.use("/api/v1/departments", departmentRoutes);
 app.use("/api/v1/material-requests", materialRequestRoutes);
+app.use("/api/v1/materials", materialRoutes);
 app.use("/api/v1/audits", auditRoutes);
 
 app.get("/api/v1/health", (req, res) => {
