@@ -54,6 +54,7 @@ const ASSIGNABLE_BY_SUPER = [
   "admin",
   "requestor",
   "user",
+  "back_office",
   ...WORKFLOW_ROLES.filter((r) => r !== "requestor"),
 ];
 

@@ -1,4 +1,8 @@
 const MaterialRequest = require("../models/materialRequestModel");
+const Material = require("../models/materialModel");
+const Department = require("../models/departmentModel");
+const User = require("../models/userModel");
+const ProjectManager = require("../models/projectManagerModel");
 const { hasPrivilege, scopedMrFilter, normalizeRole } = require("../utils/privileges");
 const { logAudit } = require("../utils/audit");
 const {
@@ -12,12 +16,134 @@ function formatDate(value = new Date()) {
 }
 
 function summarizeProducts(products = []) {
-  const list = Array.isArray(products) ? products.filter((item) => item?.name) : [];
+  const list = Array.isArray(products)
+    ? products
+        .filter((item) => (item?.productId || item?.name) && String(item?.quantity || "").trim())
+        .map((item) => ({
+          productId: String(item.productId || "").trim().toUpperCase(),
+          name: String(item.name || "").trim(),
+          description: String(item.description || "").trim(),
+          quantity: String(item.quantity || "").trim(),
+          unit: String(item.unit || "").trim(),
+          amount: Number(item.amount) || 0,
+        }))
+    : [];
   const quantity = list
     .map((item) => `${item.quantity || 0}${item.unit ? ` ${item.unit}` : ""} ${item.name}`.trim())
     .join(", ");
   const amount = list.reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
   return { quantity, amount, products: list };
+}
+
+async function resolveDepartmentKey(value, fallback) {
+  const key = String(value || fallback || "").trim().toLowerCase();
+  if (!key) {
+    const error = new Error("Select a department");
+    error.statusCode = 400;
+    throw error;
+  }
+  const department = await Department.findOne({ key });
+  if (!department) {
+    const error = new Error("Select a valid department");
+    error.statusCode = 400;
+    throw error;
+  }
+  return department.key;
+}
+
+async function resolveCreatedFor(createdForId, departmentKey) {
+  if (!createdForId || !User.base.Types.ObjectId.isValid(createdForId)) {
+    const error = new Error("Select who this request is created for");
+    error.statusCode = 400;
+    throw error;
+  }
+  const requester = await User.findOne({
+    _id: createdForId,
+    department: departmentKey,
+    active: { $ne: false },
+  });
+  if (!requester) {
+    const error = new Error("Select a user from this department");
+    error.statusCode = 400;
+    throw error;
+  }
+  return requester;
+}
+
+async function resolveProjectManager(project, departmentKey) {
+  const projectKey = String(project || "").trim().toLowerCase();
+  if (!projectKey || !departmentKey) return null;
+  const appointment = await ProjectManager.findOne({ projectKey, department: departmentKey });
+  if (!appointment?.managerId) return null;
+  return User.findOne({ _id: appointment.managerId, active: { $ne: false } });
+}
+
+async function requireProjectManager(project, departmentKey) {
+  const manager = await resolveProjectManager(project, departmentKey);
+  if (!manager) {
+    const error = new Error("No manager is appointed for this department on this project");
+    error.statusCode = 400;
+    throw error;
+  }
+  return manager;
+}
+
+function sameProject(left, right) {
+  return String(left || "").trim().toLowerCase() === String(right || "").trim().toLowerCase();
+}
+
+async function resolveCatalogLines(products, departmentKey, projectName) {
+  const project = String(projectName || "").trim();
+  if (!project) {
+    const error = new Error("Select a project");
+    error.statusCode = 400;
+    throw error;
+  }
+  const summary = summarizeProducts(products);
+  if (!summary.products.length) {
+    const error = new Error("Add at least one material row");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (summary.products.some((item) => !item.productId)) {
+    const error = new Error("Select a product id for each row");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const ids = [...new Set(summary.products.map((item) => item.productId))];
+  const materials = await Material.find({
+    productId: { $in: ids },
+    department: departmentKey,
+    active: { $ne: false },
+  });
+  const byId = new Map(materials.map((item) => [item.productId, item]));
+  const lines = summary.products.map((item) => {
+    const material = byId.get(item.productId);
+    if (!material) {
+      const error = new Error(`Product ${item.productId} is not listed for this department`);
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!sameProject(material.project, project)) {
+      const error = new Error(`Product ${item.productId} is not listed for this project`);
+      error.statusCode = 400;
+      throw error;
+    }
+    return {
+      productId: material.productId,
+      name: material.name,
+      description: item.description || "",
+      quantity: item.quantity,
+      unit: material.unit || "",
+      amount: item.amount,
+    };
+  });
+  const quantity = lines
+    .map((item) => `${item.quantity}${item.unit ? ` ${item.unit}` : ""} ${item.name}`.trim())
+    .join(", ");
+  const amount = lines.reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
+  return { products: lines, quantity, amount };
 }
 
 async function nextMrNo() {
@@ -38,6 +164,10 @@ function toPublic(record) {
     project: record.project,
     requestedBy: record.requestedBy,
     requestedById: record.requestedById ? String(record.requestedById) : "",
+    createdBy: record.createdBy || "",
+    createdById: record.createdById ? String(record.createdById) : "",
+    assignedTo: record.assignedTo || "",
+    assignedToId: record.assignedToId ? String(record.assignedToId) : "",
     department: record.department || "",
     justification: record.justification || "",
     products: record.products || [],
@@ -65,8 +195,16 @@ function canAccessRecord(actor, record) {
       "Pending Receipt",
     ].includes(record.status);
   }
-  if (role === "requestor") return String(record.requestedById) === actor.id;
-  if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
+  if (role === "requestor") {
+    return String(record.requestedById) === actor.id || String(record.createdById) === actor.id;
+  }
+  if (role === "manager") {
+    if (record.assignedToId) return String(record.assignedToId) === actor.id;
+    const actorDept = String(actor.department || "").trim().toLowerCase();
+    const recordDept = String(record.department || "").trim().toLowerCase();
+    return !recordDept || !actorDept || recordDept === actorDept;
+  }
+  if (["department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
     const actorDept = String(actor.department || "").trim().toLowerCase();
     if (!actorDept) return true;
     const recordDept = String(record.department || "").trim().toLowerCase();
@@ -91,6 +229,34 @@ function hasTransitionPrivilege(actor, transition) {
   const [moduleKey, action] = transition.privilege.split(".");
   return hasPrivilege(actor, moduleKey, action);
 }
+
+const listAssignees = async (req, res) => {
+  try {
+    const canLoad =
+      hasPrivilege(req.user, "material_requests", "create") ||
+      hasPrivilege(req.user, "material_requests", "edit");
+    if (!canLoad) return res.status(403).json({ message: "You cannot load requesters" });
+
+    const department = await resolveDepartmentKey(req.query.department);
+    const requesters = await User.find({
+      department,
+      active: { $ne: false },
+    })
+      .sort({ name: 1 })
+      .select("name");
+    const manager = await resolveProjectManager(req.query.project, department);
+    res.status(200).json({
+      requesters: requesters.map((item) => ({
+        id: item._id.toString(),
+        name: item.name,
+        email: item.email,
+      })),
+      manager: manager ? { id: manager._id.toString(), name: manager.name } : null,
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+};
 
 const listRequests = async (req, res) => {
   try {
@@ -120,20 +286,17 @@ const createRequest = async (req, res) => {
     if (!hasPrivilege(req.user, "material_requests", "create")) {
       return res.status(403).json({ message: "You cannot create material requests" });
     }
-    const { project, justification, products, status } = req.body;
-    if (!project) return res.status(400).json({ message: "Project / Department is required" });
-    const summary = summarizeProducts(products);
-    if (!summary.products.length) {
-      return res.status(400).json({ message: "Add at least one product row" });
-    }
+    const { project, justification, products, status, department: departmentInput, createdForId } = req.body;
+    if (!project) return res.status(400).json({ message: "Project is required" });
 
     const nextStatus = status === "Requested" ? "Requested" : "Draft";
-    const department = String(req.user.department || "").trim().toLowerCase();
-    if (!department) {
-      return res.status(400).json({
-        message: "Your profile has no department. Ask Super Admin to assign a department before creating MRs.",
-      });
-    }
+    const department = await resolveDepartmentKey(departmentInput, req.user.department);
+    const requester = await resolveCreatedFor(createdForId, department);
+    const manager =
+      nextStatus === "Requested"
+        ? await requireProjectManager(project, department)
+        : await resolveProjectManager(project, department);
+    const summary = await resolveCatalogLines(products, department, project);
 
     const mrNo = await nextMrNo();
     const record = await MaterialRequest.create({
@@ -143,8 +306,12 @@ const createRequest = async (req, res) => {
       products: summary.products,
       quantity: summary.quantity,
       amount: summary.amount,
-      requestedBy: req.user.name,
-      requestedById: req.user.id,
+      requestedBy: requester.name,
+      requestedById: requester._id,
+      createdBy: req.user.name,
+      createdById: req.user.id,
+      assignedTo: manager?.name || "",
+      assignedToId: manager?._id,
       department,
       status: nextStatus,
       paymentStatus: "Not started",
@@ -162,7 +329,7 @@ const createRequest = async (req, res) => {
       meta: { project: record.project, status: record.status },
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message });
   }
 };
 
@@ -174,11 +341,14 @@ const updateRequest = async (req, res) => {
       return res.status(403).json({ message: "You cannot update this material request" });
     }
 
-    const { project, justification, products, status, supplier, paymentStatus, quotation } = req.body;
+    const { project, justification, products, status, supplier, paymentStatus, quotation, department, createdForId } =
+      req.body;
     const previousStatus = record.status;
     const contentChange =
       Boolean(project) ||
       justification !== undefined ||
+      department !== undefined ||
+      createdForId !== undefined ||
       Array.isArray(products);
     const statusChange = Boolean(status) && status !== previousStatus;
     const quotationUpdate = quotation !== undefined;
@@ -234,11 +404,25 @@ const updateRequest = async (req, res) => {
 
     if (project) record.project = project;
     if (justification !== undefined) record.justification = justification;
-    if (Array.isArray(products)) {
-      const summary = summarizeProducts(products);
-      if (!summary.products.length) {
-        return res.status(400).json({ message: "Add at least one product row" });
+    if (department) record.department = await resolveDepartmentKey(department);
+    if (createdForId) {
+      const requester = await resolveCreatedFor(createdForId, record.department);
+      record.requestedBy = requester.name;
+      record.requestedById = requester._id;
+    }
+    const nextStatus = statusChange ? status : record.status;
+    if (department || createdForId || nextStatus === "Requested") {
+      const manager =
+        nextStatus === "Requested"
+          ? await requireProjectManager(record.project, record.department)
+          : await resolveProjectManager(record.project, record.department);
+      if (manager) {
+        record.assignedTo = manager.name;
+        record.assignedToId = manager._id;
       }
+    }
+    if (Array.isArray(products)) {
+      const summary = await resolveCatalogLines(products, record.department, record.project);
       record.products = summary.products;
       record.quantity = summary.quantity;
       record.amount = summary.amount;
@@ -271,7 +455,7 @@ const updateRequest = async (req, res) => {
     });
     res.status(200).json({ message: "Material request updated", materialRequest: toPublic(record) });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message });
   }
 };
 
@@ -282,7 +466,9 @@ const deleteRequest = async (req, res) => {
     const role = normalizeRole(req.user.role);
 
     if (role === "requestor") {
-      if (String(record.requestedById) !== req.user.id) {
+      const ownsRecord =
+        String(record.requestedById) === req.user.id || String(record.createdById) === req.user.id;
+      if (!ownsRecord) {
         return res.status(403).json({ message: "You can only delete your own draft requests" });
       }
       if (!EDITABLE_STATUSES.includes(record.status)) {
@@ -307,4 +493,4 @@ const deleteRequest = async (req, res) => {
   }
 };
 
-module.exports = { listRequests, getRequest, createRequest, updateRequest, deleteRequest };
+module.exports = { listAssignees, listRequests, getRequest, createRequest, updateRequest, deleteRequest };

@@ -244,7 +244,30 @@ function listFilterForRole(actor) {
   if (actor.role === "super_admin") return {};
 
   if (role === "requestor") {
-    return { requestedById: actor.id };
+    return {
+      $or: [{ requestedById: actor.id }, { createdById: actor.id }],
+    };
+  }
+
+  if (role === "manager") {
+    const dept = String(actor.department || "").trim().toLowerCase();
+    if (!dept) return { assignedToId: actor.id };
+    const escaped = dept.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return {
+      $or: [
+        { assignedToId: actor.id },
+        {
+          $and: [
+            {
+              $or: [{ department: dept }, { department: new RegExp(`^${escaped}$`, "i") }],
+            },
+            {
+              $or: [{ assignedToId: null }, { assignedToId: { $exists: false } }],
+            },
+          ],
+        },
+      ],
+    };
   }
 
   // Cross-department functions
@@ -261,7 +284,7 @@ function listFilterForRole(actor) {
   }
 
   // Department-scoped: manager, head, in-charge, admin
-  if (["manager", "department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
+  if (["department_head", "in_charge", "admin"].includes(role) || actor.role === "admin") {
     const dept = String(actor.department || "").trim().toLowerCase();
     if (!dept) {
       const inbox = roleInboxStatuses[role];
@@ -313,6 +336,7 @@ const roleCatalog = [
   { name: "Finance", key: "finance" },
   { name: "Supplier", key: "supplier" },
   { name: "Department Incharge", key: "in_charge" },
+  { name: "Back Office", key: "back_office" },
 ];
 
 const rolePrivileges = {
@@ -329,6 +353,7 @@ const rolePrivileges = {
     roles: ["view", "create", "edit", "delete"],
     privileges: ["view", "create", "edit", "delete"],
     departments: ["view", "create", "edit", "delete"],
+    materials: ["view", "create", "edit", "delete"],
     delete_requests: ["view", "approve", "reject"],
     reports: ["view", "export"],
     audits: ["view"],
@@ -386,6 +411,10 @@ const rolePrivileges = {
     dashboard: ["view"],
     material_requests: ["view", "edit"],
     deliveries: ["view", "edit"],
+    settings: ["view", "edit"],
+  },
+  back_office: {
+    materials: ["view", "create", "edit", "delete"],
     settings: ["view", "edit"],
   },
 };

@@ -2,7 +2,9 @@ const mongoose = require("mongoose");
 
 const productSchema = new mongoose.Schema(
   {
+    productId: { type: String, trim: true, uppercase: true, default: "" },
     name: { type: String, required: true, trim: true },
+    description: { type: String, trim: true, default: "" },
     quantity: { type: String, required: true, trim: true },
     unit: { type: String, trim: true, default: "" },
     amount: { type: Number, default: 0 },
@@ -16,6 +18,10 @@ const materialRequestSchema = new mongoose.Schema(
     project: { type: String, required: true, trim: true },
     requestedBy: { type: String, required: true, trim: true },
     requestedById: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    createdBy: { type: String, trim: true, default: "" },
+    createdById: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    assignedTo: { type: String, trim: true, default: "" },
+    assignedToId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     department: { type: String, trim: true, default: "" },
     justification: { type: String, trim: true, default: "" },
     products: { type: [productSchema], default: [] },
